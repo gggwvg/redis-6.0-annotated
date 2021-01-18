@@ -30,6 +30,12 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+// Sds （Simple Dynamic String，简单动态字符串
+// 在 C 语言中，字符串可以用一个 `\0` 结尾的 char 数组来表示。比如说， hello world 在 C 语言中就可以表示为 `hello world\0`
+// 这种简单的字符串表示，在大多数情况下都能满足要求，但是，它并不能高效地支持长度计算和追加（append）这两种操作：
+//     1. 每次计算字符串长度（strlen(s)）的复杂度为 θ(N)
+//     2. 对字符串进行 N 次追加，必定需要对字符串进行 N 次内存重分配（realloc）
+
 #ifndef __SDS_H
 #define __SDS_H
 
@@ -40,7 +46,16 @@ extern const char *SDS_NOINIT;
 #include <stdarg.h>
 #include <stdint.h>
 
+// sds 本身是用来取代 char*
+// 在 Redis 程序内部， 绝大部分情况下都会使用 sds 而不是 char* 来表示字符串
 typedef char *sds;
+
+// 为了节省存储空间，sds 定义了几种能支持不同最大长度的字符串类型
+
+// !!! 备注 !!!
+// msb is Most Significant Bit (高位字节)
+// lsb is LSB stands for Least Significant Bit
+// https://en.wikipedia.org/wiki/Bit_numbering
 
 /* Note: sdshdr5 is never used, we just access the flags byte directly.
  * However is here to document the layout of type 5 SDS strings. */

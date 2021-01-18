@@ -30,6 +30,10 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* I/O 多路复用模块封装了底层的 select、epoll、avport 以及 kqueue 这些 I/O 多路复用函数，
+ * 为上层提供了相同的接口。
+ */
+
 #include <stdio.h>
 #include <sys/time.h>
 #include <sys/types.h>
