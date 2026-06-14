@@ -522,7 +522,7 @@ start_server {tags {"repl"}} {
     # If running on Linux, we also measure utime/stime to detect possible I/O handling issues
     set os [catch {exec unamee}]
     set measure_time [expr {$os == "Linux"} ? 1 : 0]
-    foreach all_drop {no slow fast all} {
+    foreach all_drop {no slow fast all timeout} {
         test "diskless $all_drop replicas drop during rdb pipe" {
             set replicas {}
             set replicas_alive {}
@@ -570,6 +570,12 @@ start_server {tags {"repl"}} {
                         exec kill [srv -1 pid]
                         set replicas_alive [lreplace $replicas_alive 0 0]
                     }
+                    if {$all_drop == "timeout"} {
+                        $master config set repl-timeout 1
+                        # we want this replica to hang on a key for very long so it'll reach repl-timeout
+                        exec kill -SIGSTOP [srv -1 pid]
+                        after 3000
+                    }
 
                     # wait for rdb child to exit
                     wait_for_condition 500 100 {
@@ -588,6 +594,14 @@ start_server {tags {"repl"}} {
                     if {$all_drop == "slow" || $all_drop == "fast"} {
                         wait_for_log_messages -2 {"*Diskless rdb transfer, done reading from pipe, 1 replicas still up*"} $loglines 1 1
                     }
+                    if {$all_drop == "timeout"} {
+                        wait_for_log_messages -2 {"*Disconnecting timedout replica (full sync)*"} $loglines 1 1
+                        wait_for_log_messages -2 {"*Diskless rdb transfer, done reading from pipe, 1 replicas still up*"} $loglines 1 1
+                        # master disconnected the slow replica, remove from array
+                        set replicas_alive [lreplace $replicas_alive 0 0]
+                        # release it
+                        exec kill -SIGCONT [srv -1 pid]
+                    }
 
                     # make sure we don't have a busy loop going thought epoll_wait
                     if {$measure_time} {
@@ -601,11 +615,11 @@ start_server {tags {"repl"}} {
                             puts "master utime: $master_utime"
                             puts "master stime: $master_stime"
                         }
-                        if {$all_drop == "all" || $all_drop == "slow"} {
+                        if {!$::no_latency && ($all_drop == "all" || $all_drop == "slow" || $all_drop == "timeout")} {
                             assert {$master_utime < 70}
                             assert {$master_stime < 70}
                         }
-                        if {$all_drop == "none" || $all_drop == "fast"} {
+                        if {!$::no_latency && ($all_drop == "none" || $all_drop == "fast")} {
                             assert {$master_utime < 15}
                             assert {$master_stime < 15}
                         }
@@ -638,6 +652,87 @@ start_server {tags {"repl"}} {
                     }
                 }
             }
+        }
+    }
+}
+
+test "diskless replication child being killed is collected" {
+    # when diskless master is waiting for the replica to become writable
+    # it removes the read event from the rdb pipe so if the child gets killed
+    # the replica will hung. and the master may not collect the pid with wait3
+    start_server {tags {"repl"}} {
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+        set master_pid [srv 0 pid]
+        $master config set repl-diskless-sync yes
+        $master config set repl-diskless-sync-delay 0
+        # put enough data in the db that the rdb file will be bigger than the socket buffers
+        $master debug populate 20000 test 10000
+        $master config set rdbcompression no
+        start_server {} {
+            set replica [srv 0 client]
+            set loglines [count_log_lines 0]
+            $replica config set repl-diskless-load swapdb
+            $replica config set key-load-delay 1000000
+            $replica replicaof $master_host $master_port
+
+            # wait for the replicas to start reading the rdb
+            wait_for_log_messages 0 {"*Loading DB in memory*"} $loglines 800 10
+
+            # wait to be sure the eplica is hung and the master is blocked on write
+            after 500
+
+            # simulate the OOM killer or anyone else kills the child
+            set fork_child_pid [get_child_pid -1]
+            puts "fork child is $fork_child_pid"
+            exec kill -9 $fork_child_pid
+
+            # wait for the parent to notice the child have exited
+            wait_for_condition 50 100 {
+                [s -1 rdb_bgsave_in_progress] == 0
+            } else {
+                fail "rdb child didn't terminate"
+            }
+        }
+    }
+}
+
+test "diskless replication read pipe cleanup" {
+    # In diskless replication, we create a read pipe for the RDB, between the child and the parent.
+    # When we close this pipe (fd), the read handler also needs to be removed from the event loop (if it still registered).
+    # Otherwise, next time we will use the same fd, the registration will be fail (panic), because
+    # we will use EPOLL_CTL_MOD (the fd still register in the event loop), on fd that already removed from epoll_ctl
+    start_server {tags {"repl"}} {
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+        set master_pid [srv 0 pid]
+        $master config set repl-diskless-sync yes
+        $master config set repl-diskless-sync-delay 0
+
+        # put enough data in the db, and slowdown the save, to keep the parent busy at the read process
+        $master config set rdb-key-save-delay 100000
+        $master debug populate 20000 test 10000
+        $master config set rdbcompression no
+        start_server {} {
+            set replica [srv 0 client]
+            set loglines [count_log_lines 0]
+            $replica config set repl-diskless-load swapdb
+            $replica replicaof $master_host $master_port
+
+            # wait for the replicas to start reading the rdb
+            wait_for_log_messages 0 {"*Loading DB in memory*"} $loglines 800 10
+
+            set loglines [count_log_lines 0]
+            # send FLUSHALL so the RDB child will be killed
+            $master flushall
+
+            # wait for another RDB child process to be started
+            wait_for_log_messages -1 {"*Background RDB transfer started by pid*"} $loglines 800 10
+
+            # make sure master is alive
+            $master ping
         }
     }
 }

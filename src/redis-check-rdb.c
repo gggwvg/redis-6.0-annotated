@@ -27,10 +27,13 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mt19937-64.h"
 #include "server.h"
 #include "rdb.h"
 
 #include <stdarg.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 void createSharedObjects(void);
 void rdbLoadProgressCallback(rio *r, const void *buf, size_t len);
@@ -58,6 +61,7 @@ struct {
 #define RDB_CHECK_DOING_CHECK_SUM 5
 #define RDB_CHECK_DOING_READ_LEN 6
 #define RDB_CHECK_DOING_READ_AUX 7
+#define RDB_CHECK_DOING_READ_MODULE_AUX 8
 
 char *rdb_check_doing_string[] = {
     "start",
@@ -67,7 +71,8 @@ char *rdb_check_doing_string[] = {
     "read-object-value",
     "check-sum",
     "read-len",
-    "read-aux"
+    "read-aux",
+    "read-module-aux"
 };
 
 char *rdb_type_string[] = {
@@ -244,7 +249,7 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
             rdbstate.doing = RDB_CHECK_DOING_READ_LEN;
             if ((dbid = rdbLoadLen(&rdb,NULL)) == RDB_LENERR)
                 goto eoferr;
-            rdbCheckInfo("Selecting DB ID %d", dbid);
+            rdbCheckInfo("Selecting DB ID %llu", (unsigned long long)dbid);
             continue; /* Read type again. */
         } else if (type == RDB_OPCODE_RESIZEDB) {
             /* RESIZEDB: Hint about the size of the keys in the currently
@@ -271,6 +276,21 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
                 (char*)auxkey->ptr, (char*)auxval->ptr);
             decrRefCount(auxkey);
             decrRefCount(auxval);
+            continue; /* Read type again. */
+        } else if (type == RDB_OPCODE_MODULE_AUX) {
+            /* AUX: Auxiliary data for modules. */
+            uint64_t moduleid, when_opcode, when;
+            rdbstate.doing = RDB_CHECK_DOING_READ_MODULE_AUX;
+            if ((moduleid = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+            if ((when_opcode = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+            if ((when = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+
+            char name[10];
+            moduleTypeNameByID(name,moduleid);
+            rdbCheckInfo("MODULE AUX for: %s", name);
+
+            robj *o = rdbLoadCheckModuleValue(&rdb,name);
+            decrRefCount(o);
             continue; /* Read type again. */
         } else {
             if (!rdbIsObjectType(type)) {
@@ -331,7 +351,7 @@ err:
     return 1;
 }
 
-/* RDB check main: called form redis.c when Redis is executed with the
+/* RDB check main: called form server.c when Redis is executed with the
  * redis-check-rdb alias, on during RDB loading errors.
  *
  * The function works in two ways: can be called with argc/argv as a
@@ -344,10 +364,16 @@ err:
  * Otherwise if called with a non NULL fp, the function returns C_OK or
  * C_ERR depending on the success or failure. */
 int redis_check_rdb_main(int argc, char **argv, FILE *fp) {
+    struct timeval tv;
+
     if (argc != 2 && fp == NULL) {
         fprintf(stderr, "Usage: %s <rdb-file-name>\n", argv[0]);
         exit(1);
     }
+
+    gettimeofday(&tv, NULL);
+    init_genrand64(((long long) tv.tv_sec * 1000000 + tv.tv_usec) ^ getpid());
+
     /* In order to call the loading functions we need to create the shared
      * integer objects, however since this function may be called from
      * an already initialized Redis instance, check if we really need to. */

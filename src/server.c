@@ -33,6 +33,7 @@
 #include "bio.h"
 #include "latency.h"
 #include "atomicvar.h"
+#include "mt19937-64.h"
 
 #include <time.h>
 #include <signal.h>
@@ -56,6 +57,10 @@
 #include <locale.h>
 #include <sys/socket.h>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 /* Our shared "common" objects */
 
 struct sharedObjectsStruct shared;
@@ -70,7 +75,6 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 
 /* Global vars */
 struct redisServer server; /* Server global state */
-volatile unsigned long lru_clock; /* Server global current LRU time. */
 
 /* Our command table.
  *
@@ -115,7 +119,7 @@ volatile unsigned long lru_clock; /* Server global current LRU time. */
  * write:       Write command (may modify the key space).
  *
  * read-only:   All the non special commands just reading from keys without
- *              changing the content, or returning other informations like
+ *              changing the content, or returning other information like
  *              the TIME command. Special commands such administrative commands
  *              or transaction related commands (multi, exec, discard, ...)
  *              are not flagged as read-only commands, since they affect the
@@ -424,11 +428,11 @@ struct redisCommand redisCommandTable[] = {
 
     {"zunionstore",zunionstoreCommand,-4,
      "write use-memory @sortedset",
-     0,zunionInterGetKeys,0,0,0,0,0,0},
+     0,zunionInterGetKeys,1,1,1,0,0,0},
 
     {"zinterstore",zinterstoreCommand,-4,
      "write use-memory @sortedset",
-     0,zunionInterGetKeys,0,0,0,0,0,0},
+     0,zunionInterGetKeys,1,1,1,0,0,0},
 
     {"zrange",zrangeCommand,-4,
      "read-only @sortedset",
@@ -883,20 +887,20 @@ struct redisCommand redisCommandTable[] = {
 
     /* GEORADIUS has store options that may write. */
     {"georadius",georadiusCommand,-6,
-     "write @geo",
+     "write use-memory @geo",
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadius_ro",georadiusroCommand,-6,
      "read-only @geo",
-     0,georadiusGetKeys,1,1,1,0,0,0},
+     0,NULL,1,1,1,0,0,0},
 
     {"georadiusbymember",georadiusbymemberCommand,-5,
-     "write @geo",
+     "write use-memory @geo",
      0,georadiusGetKeys,1,1,1,0,0,0},
 
     {"georadiusbymember_ro",georadiusbymemberroCommand,-5,
      "read-only @geo",
-     0,georadiusGetKeys,1,1,1,0,0,0},
+     0,NULL,1,1,1,0,0,0},
 
     {"geohash",geohashCommand,-2,
      "read-only @geo",
@@ -952,11 +956,11 @@ struct redisCommand redisCommandTable[] = {
 
     {"xread",xreadCommand,-4,
      "read-only @stream @blocking",
-     0,xreadGetKeys,1,1,1,0,0,0},
+     0,xreadGetKeys,0,0,0,0,0,0},
 
     {"xreadgroup",xreadCommand,-7,
      "write @stream @blocking",
-     0,xreadGetKeys,1,1,1,0,0,0},
+     0,xreadGetKeys,0,0,0,0,0,0},
 
     {"xgroup",xgroupCommand,-2,
      "write use-memory @stream",
@@ -1280,7 +1284,7 @@ dictType objectKeyHeapPointerValueDictType = {
     dictVanillaFree            /* val destructor */
 };
 
-/* Set dictionary type. Keys are SDS strings, values are ot used. */
+/* Set dictionary type. Keys are SDS strings, values are not used. */
 dictType setDictType = {
     dictSdsHash,               /* hash function */
     NULL,                      /* key dup */
@@ -1385,9 +1389,8 @@ dictType clusterNodesBlackListDictType = {
     NULL                        /* val destructor */
 };
 
-/* Cluster re-addition blacklist. This maps node IDs to the time
- * we can re-add this node. The goal is to avoid readding a removed
- * node for some time. */
+/* Modules system dictionary type. Keys are module name,
+ * values are pointer to RedisModule struct. */
 dictType modulesDictType = {
     dictSdsCaseHash,            /* hash function */
     NULL,                       /* key dup */
@@ -1440,7 +1443,7 @@ void tryResizeHashTables(int dbid) {
 /* Our hash table implementation performs rehashing incrementally while
  * we write/read from the hash table. Still if the server is idle, the hash
  * table will use two tables for a long time. So we try to use 1 millisecond
- * of CPU time at every call of this function to perform some rehahsing.
+ * of CPU time at every call of this function to perform some rehashing.
  *
  * The function returns 1 if some rehashing was performed, otherwise 0
  * is returned. */
@@ -1462,13 +1465,15 @@ int incrementallyRehash(int dbid) {
  * as we want to avoid resizing the hash tables when there is a child in order
  * to play well with copy-on-write (otherwise when a resize happens lots of
  * memory pages are copied). The goal of this function is to update the ability
- * for dict.c to resize the hash tables accordingly to the fact we have o not
- * running childs. */
+ * for dict.c to resize or rehash the tables accordingly to the fact we have an
+ * active fork child running. */
 void updateDictResizePolicy(void) {
-    if (!hasActiveChildProcess())
-        dictEnableResize();
+    if (server.in_fork_child != CHILD_TYPE_NONE)
+        dictSetResizeEnabled(DICT_RESIZE_FORBID);
+    else if (hasActiveChildProcess())
+        dictSetResizeEnabled(DICT_RESIZE_AVOID);
     else
-        dictDisableResize();
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
 }
 
 /* Return true if there are no active children processes doing RDB saving,
@@ -1575,7 +1580,7 @@ size_t ClientsPeakMemInput[CLIENTS_PEAK_MEM_USAGE_SLOTS];
 size_t ClientsPeakMemOutput[CLIENTS_PEAK_MEM_USAGE_SLOTS];
 
 int clientsCronTrackExpansiveClients(client *c) {
-    size_t in_usage = sdsAllocSize(c->querybuf);
+    size_t in_usage = sdsZmallocSize(c->querybuf) + c->argv_len_sum;
     size_t out_usage = getClientOutputBufferMemoryUsage(c);
     int i = server.unixtime % CLIENTS_PEAK_MEM_USAGE_SLOTS;
     int zeroidx = (i+1) % CLIENTS_PEAK_MEM_USAGE_SLOTS;
@@ -1610,10 +1615,12 @@ int clientsCronTrackClientsMemUsage(client *c) {
     size_t mem = 0;
     int type = getClientType(c);
     mem += getClientOutputBufferMemoryUsage(c);
-    mem += sdsAllocSize(c->querybuf);
-    mem += sizeof(client);
+    mem += sdsZmallocSize(c->querybuf);
+    mem += zmalloc_size(c);
+    mem += c->argv_len_sum;
+    if (c->argv) mem += zmalloc_size(c->argv);
     /* Now that we have the memory used by the client, remove the old
-     * value from the old categoty, and add it back. */
+     * value from the old category, and add it back. */
     server.stat_clients_type_memory[c->client_cron_last_memory_type] -=
         c->client_cron_last_memory_usage;
     server.stat_clients_type_memory[type] += mem;
@@ -1774,14 +1781,6 @@ void updateCachedTime(int update_daylight_info) {
 void checkChildrenDone(void) {
     int statloc;
     pid_t pid;
-
-    /* If we have a diskless rdb child (note that we support only one concurrent
-     * child), we want to avoid collecting it's exit status and acting on it
-     * as long as we didn't finish to drain the pipe, since then we're at risk
-     * of starting a new fork and a new pipe before we're done with the previous
-     * one. */
-    if (server.rdb_child_pid != -1 && server.rdb_pipe_conns)
-        return;
 
     if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
         int exitcode = WEXITSTATUS(statloc);
@@ -2019,6 +2018,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
         }
     }
+    /* Just for the sake of defensive programming, to avoid forgeting to
+     * call this function when need. */
+    updateDictResizePolicy();
 
 
     /* AOF postponed flush: Try at every cron cycle if the slow fsync
@@ -2028,7 +2030,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* AOF write errors: in this case we have a buffer to flush as well and
      * clear the AOF error in case of success to make the DB writable again,
      * however to try every second is enough in case of 'hz' is set to
-     * an higher frequency. */
+     * a higher frequency. */
     run_with_period(1000) {
         if (server.aof_last_write_status == C_ERR)
             flushAppendOnlyFile(0);
@@ -2109,6 +2111,10 @@ extern int ProcessingEventsWhileBlocked;
  * call some other low-risk functions. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
+
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory)
+        server.stat_peak_memory = zmalloc_used;
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -2192,18 +2198,28 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Close clients that need to be closed asynchronous */
     freeClientsInAsyncFreeQueue();
 
+    /* Try to process blocked clients every once in while. Example: A module
+     * calls RM_SignalKeyAsReady from within a timer callback (So we don't
+     * visit processCommand() at all). */
+    handleClientsBlockedOnKeys();
+
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. Redis main thread will not touch anything at this
      * time. */
     if (moduleCount()) moduleReleaseGIL();
+
+    /* Do NOT add anything below moduleReleaseGIL !!! */
 }
 
-/* This function is called immadiately after the event loop multiplexing
+/* This function is called immediately after the event loop multiplexing
  * API returned, and the control is going to soon return to Redis by invoking
  * the different events callbacks. */
 void afterSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* Do NOT add anything above moduleAcquireGIL !!! */
+
+    /* Aquire the modules GIL so that their threads won't touch anything. */
     if (!ProcessingEventsWhileBlocked) {
         if (moduleCount()) moduleAcquireGIL();
     }
@@ -2420,7 +2436,7 @@ void initServerConfig(void) {
     R_NegInf = -1.0/R_Zero;
     R_Nan = R_Zero/R_Zero;
 
-    /* Command table -- we initiialize it here as it is part of the
+    /* Command table -- we initialize it here as it is part of the
      * initial configuration, since command names may be changed via
      * redis.conf using the rename-command directive. */
     server.commands = dictCreate(&commandTableDictType,NULL);
@@ -2544,7 +2560,7 @@ static void readOOMScoreAdj(void) {
  */
 int setOOMScoreAdj(int process_class) {
 
-    if (!server.oom_score_adj) return C_OK;
+    if (server.oom_score_adj == OOM_SCORE_ADJ_NO) return C_OK;
     if (process_class == -1)
         process_class = (server.masterhost ? CONFIG_OOM_REPLICA : CONFIG_OOM_MASTER);
 
@@ -2555,7 +2571,9 @@ int setOOMScoreAdj(int process_class) {
     int val;
     char buf[64];
 
-    val = server.oom_score_adj_base + server.oom_score_adj_values[process_class];
+    val = server.oom_score_adj_values[process_class];
+    if (server.oom_score_adj == OOM_SCORE_RELATIVE)
+        val += server.oom_score_adj_base;
     if (val > 1000) val = 1000;
     if (val < -1000) val = -1000;
 
@@ -2741,13 +2759,14 @@ int listenToPort(int port, int *fds, int *count) {
                 server.tcp_backlog);
         }
         if (fds[*count] == ANET_ERR) {
+            int net_errno = errno;
             serverLog(LL_WARNING,
                 "Could not create server TCP listening socket %s:%d: %s",
                 server.bindaddr[j] ? server.bindaddr[j] : "*",
                 port, server.neterr);
-                if (errno == ENOPROTOOPT     || errno == EPROTONOSUPPORT ||
-                    errno == ESOCKTNOSUPPORT || errno == EPFNOSUPPORT ||
-                    errno == EAFNOSUPPORT    || errno == EADDRNOTAVAIL)
+                if (net_errno == ENOPROTOOPT     || net_errno == EPROTONOSUPPORT ||
+                    net_errno == ESOCKTNOSUPPORT || net_errno == EPFNOSUPPORT ||
+                    net_errno == EAFNOSUPPORT    || net_errno == EADDRNOTAVAIL)
                     continue;
             return C_ERR;
         }
@@ -2800,12 +2819,21 @@ void resetServerStats(void) {
     server.aof_delayed_fsync = 0;
 }
 
+/* Make the thread killable at any time, so that kill threads functions
+ * can work reliably (default cancelability type is PTHREAD_CANCEL_DEFERRED).
+ * Needed for pthread_cancel used by the fast memory test used by the crash report. */
+void makeThreadKillable(void) {
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+}
+
 void initServer(void) {
     int j;
 
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
     setupSignalHandlers();
+    makeThreadKillable();
 
     if (server.syslog_enabled) {
         openlog(server.syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT,
@@ -2816,6 +2844,8 @@ void initServer(void) {
     server.aof_state = server.aof_enabled ? AOF_ON : AOF_OFF;
     server.hz = server.config_hz;
     server.pid = getpid();
+    server.in_fork_child = CHILD_TYPE_NONE;
+    server.main_thread_id = pthread_self();
     server.current_client = NULL;
     server.fixed_time_expire = 0;
     server.clients = listCreate();
@@ -3085,7 +3115,7 @@ int populateCommandTableParseFlags(struct redisCommand *c, char *strflags) {
 }
 
 /* Populates the Redis Command Table starting from the hard coded list
- * we have on top of redis.c file. */
+ * we have on top of server.c file. */
 void populateCommandTable(void) {
     int j;
     int numcommands = sizeof(redisCommandTable)/sizeof(struct redisCommand);
@@ -3166,7 +3196,7 @@ struct redisCommand *lookupCommand(sds name) {
     return dictFetchValue(server.commands, name);
 }
 
-struct redisCommand *lookupCommandByCString(char *s) {
+struct redisCommand *lookupCommandByCString(const char *s) {
     struct redisCommand *cmd;
     sds name = sdsnew(s);
 
@@ -3219,12 +3249,12 @@ void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
  *
  * 'cmd' must be a pointer to the Redis command to replicate, dbid is the
  * database ID the command should be propagated into.
- * Arguments of the command to propagte are passed as an array of redis
+ * Arguments of the command to propagate are passed as an array of redis
  * objects pointers of len 'argc', using the 'argv' vector.
  *
  * The function does not take a reference to the passed 'argv' vector,
  * so it is up to the caller to release the passed argv (but it is usually
- * stack allocated).  The function autoamtically increments ref count of
+ * stack allocated).  The function automatically increments ref count of
  * passed objects, so the caller does not need to. */
 void alsoPropagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
                    int target)
@@ -3310,8 +3340,6 @@ void call(client *c, int flags) {
     int client_old_flags = c->flags;
     struct redisCommand *real_cmd = c->cmd;
 
-    server.fixed_time_expire++;
-
     /* Send the command to clients in MONITOR mode if applicable.
      * Administrative commands are considered too dangerous to be shown. */
     if (listLength(server.monitors) &&
@@ -3329,12 +3357,25 @@ void call(client *c, int flags) {
 
     /* Call the command. */
     dirty = server.dirty;
-    updateCachedTime(0);
+
+    /* Update cache time, in case we have nested calls we want to
+     * update only on the first call*/
+    if (server.fixed_time_expire++ == 0) {
+        updateCachedTime(0);
+    }
+
     start = server.ustime;
     c->cmd->proc(c);
     duration = ustime()-start;
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
+
+    /* After executing command, we will close the client after writing entire
+     * reply if it is set 'CLIENT_CLOSE_AFTER_COMMAND' flag. */
+    if (c->flags & CLIENT_CLOSE_AFTER_COMMAND) {
+        c->flags &= ~CLIENT_CLOSE_AFTER_COMMAND;
+        c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+    }
 
     /* When EVAL is called loading the AOF we don't want commands called
      * from Lua to go into the slowlog or to populate statistics. */
@@ -3384,7 +3425,7 @@ void call(client *c, int flags) {
         if (c->flags & CLIENT_FORCE_AOF) propagate_flags |= PROPAGATE_AOF;
 
         /* However prevent AOF / replication propagation if the command
-         * implementations called preventCommandPropagation() or similar,
+         * implementation called preventCommandPropagation() or similar,
          * or if we don't have the call() flags to do so. */
         if (c->flags & CLIENT_PREVENT_REPL_PROP ||
             !(flags & CMD_CALL_PROPAGATE_REPL))
@@ -3462,6 +3503,12 @@ void call(client *c, int flags) {
 
     server.fixed_time_expire--;
     server.stat_numcommands++;
+
+    /* Record peak memory after each command and before the eviction that runs
+     * before the next command. */
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory)
+        server.stat_peak_memory = zmalloc_used;
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -3545,13 +3592,8 @@ int processCommand(client *c) {
     int is_denyloading_command = !(c->cmd->flags & CMD_LOADING) ||
                                  (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_LOADING));
 
-    /* Check if the user is authenticated. This check is skipped in case
-     * the default user is flagged as "nopass" and is active. */
-    int auth_required = (!(DefaultUser->flags & USER_FLAG_NOPASS) ||
-                          (DefaultUser->flags & USER_FLAG_DISABLED)) &&
-                        !c->authenticated;
-    if (auth_required) {
-        /* AUTH and HELLO and no auth modules are valid even in
+    if (authRequired(c)) {
+        /* AUTH and HELLO and no auth commands are valid even in
          * non-authenticated state. */
         if (!(c->cmd->flags & CMD_NO_AUTH)) {
             rejectCommand(c,shared.noautherr);
@@ -3632,7 +3674,7 @@ int processCommand(client *c) {
         }
 
         /* Save out_of_memory result at script start, otherwise if we check OOM
-         * untill first write within script, memory used by lua stack and
+         * until first write within script, memory used by lua stack and
          * arguments might interfere. */
         if (c->cmd->proc == evalCommand || c->cmd->proc == evalShaCommand) {
             server.lua_oom = out_of_memory;
@@ -3798,6 +3840,10 @@ int prepareForShutdown(int flags) {
        overwrite the synchronous saving did by SHUTDOWN. */
     if (server.rdb_child_pid != -1) {
         serverLog(LL_WARNING,"There is a child saving an .rdb. Killing it!");
+        /* Note that, in killRDBChild, we call rdbRemoveTempFile that will
+         * do close fd(in order to unlink file actully) in background thread.
+         * The temp rdb file fd may won't be closed when redis exits quickly,
+         * but OS will close this fd when process exits. */
         killRDBChild();
     }
 
@@ -3870,7 +3916,7 @@ int prepareForShutdown(int flags) {
 
 /*================================== Commands =============================== */
 
-/* Sometimes Redis cannot accept write commands because there is a perstence
+/* Sometimes Redis cannot accept write commands because there is a persistence
  * error with the RDB or AOF file, and Redis is configured in order to stop
  * accepting writes in such situation. This function returns if such a
  * condition is active, and the type of the condition.
@@ -4019,7 +4065,8 @@ NULL
         addReplyLongLong(c, dictSize(server.commands));
     } else if (!strcasecmp(c->argv[1]->ptr,"getkeys") && c->argc >= 3) {
         struct redisCommand *cmd = lookupCommand(c->argv[2]->ptr);
-        int *keys, numkeys, j;
+        getKeysResult result = GETKEYS_RESULT_INIT;
+        int j;
 
         if (!cmd) {
             addReplyError(c,"Invalid command specified");
@@ -4034,14 +4081,13 @@ NULL
             return;
         }
 
-        keys = getKeysFromCommand(cmd,c->argv+2,c->argc-2,&numkeys);
-        if (!keys) {
+        if (!getKeysFromCommand(cmd,c->argv+2,c->argc-2,&result)) {
             addReplyError(c,"Invalid arguments specified for command");
         } else {
-            addReplyArrayLen(c,numkeys);
-            for (j = 0; j < numkeys; j++) addReplyBulk(c,c->argv[keys[j]+2]);
-            getKeysFreeResult(keys);
+            addReplyArrayLen(c,result.numkeys);
+            for (j = 0; j < result.numkeys; j++) addReplyBulk(c,c->argv[result.keys[j]+2]);
         }
+        getKeysFreeResult(&result);
     } else {
         addReplySubcommandSyntaxError(c);
     }
@@ -4708,6 +4754,21 @@ void monitorCommand(client *c) {
 
 /* =================================== Main! ================================ */
 
+int checkIgnoreWarning(const char *warning) {
+    int argc, j;
+    sds *argv = sdssplitargs(server.ignore_warnings, &argc);
+    if (argv == NULL)
+        return 0;
+
+    for (j = 0; j < argc; j++) {
+        char *flag = argv[j];
+        if (!strcasecmp(flag, warning))
+            break;
+    }
+    sdsfreesplitres(argv,argc);
+    return j < argc;
+}
+
 #ifdef __linux__
 int linuxOvercommitMemoryValue(void) {
     FILE *fp = fopen("/proc/sys/vm/overcommit_memory","r");
@@ -4731,6 +4792,141 @@ void linuxMemoryWarnings(void) {
         serverLog(LL_WARNING,"WARNING you have Transparent Huge Pages (THP) support enabled in your kernel. This will create latency and memory usage issues with Redis. To fix this issue run the command 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled' as root, and add it to your /etc/rc.local in order to retain the setting after a reboot. Redis must be restarted after THP is disabled (set to 'madvise' or 'never').");
     }
 }
+
+#ifdef __arm64__
+
+/* Get size in kilobytes of the Shared_Dirty pages of the calling process for the
+ * memory map corresponding to the provided address, or -1 on error. */
+static int smapsGetSharedDirty(unsigned long addr) {
+    int ret, in_mapping = 0, val = -1;
+    unsigned long from, to;
+    char buf[64];
+    FILE *f;
+
+    f = fopen("/proc/self/smaps", "r");
+    if (!f) return -1;
+
+    while (1) {
+        if (!fgets(buf, sizeof(buf), f))
+            break;
+
+        ret = sscanf(buf, "%lx-%lx", &from, &to);
+        if (ret == 2)
+            in_mapping = from <= addr && addr < to;
+
+        if (in_mapping && !memcmp(buf, "Shared_Dirty:", 13)) {
+            sscanf(buf, "%*s %d", &val);
+            /* If parsing fails, we remain with val == -1 */
+            break;
+        }
+    }
+
+    fclose(f);
+    return val;
+}
+
+/* Older arm64 Linux kernels have a bug that could lead to data corruption
+ * during background save in certain scenarios. This function checks if the
+ * kernel is affected.
+ * The bug was fixed in commit ff1712f953e27f0b0718762ec17d0adb15c9fd0b
+ * titled: "arm64: pgtable: Ensure dirty bit is preserved across pte_wrprotect()"
+ * Return -1 on unexpected test failure, 1 if the kernel seems to be affected,
+ * and 0 otherwise. */
+int linuxMadvFreeForkBugCheck(void) {
+    int ret, pipefd[2] = { -1, -1 };
+    pid_t pid;
+    char *p = NULL, *q;
+    int bug_found = 0;
+    long page_size = sysconf(_SC_PAGESIZE);
+    long map_size = 3 * page_size;
+
+    /* Create a memory map that's in our full control (not one used by the allocator). */
+    p = mmap(NULL, map_size, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) {
+        serverLog(LL_WARNING, "Failed to mmap(): %s", strerror(errno));
+        return -1;
+    }
+
+    q = p + page_size;
+
+    /* Split the memory map in 3 pages by setting their protection as RO|RW|RO to prevent
+     * Linux from merging this memory map with adjacent VMAs. */
+    ret = mprotect(q, page_size, PROT_READ | PROT_WRITE);
+    if (ret < 0) {
+        serverLog(LL_WARNING, "Failed to mprotect(): %s", strerror(errno));
+        bug_found = -1;
+        goto exit;
+    }
+
+    /* Write to the page once to make it resident */
+    *(volatile char*)q = 0;
+
+    /* Tell the kernel that this page is free to be reclaimed. */
+#ifndef MADV_FREE
+#define MADV_FREE 8
+#endif
+    ret = madvise(q, page_size, MADV_FREE);
+    if (ret < 0) {
+        /* MADV_FREE is not available on older kernels that are presumably
+         * not affected. */
+        if (errno == EINVAL) goto exit;
+
+        serverLog(LL_WARNING, "Failed to madvise(): %s", strerror(errno));
+        bug_found = -1;
+        goto exit;
+    }
+
+    /* Write to the page after being marked for freeing, this is supposed to take
+     * ownership of that page again. */
+    *(volatile char*)q = 0;
+
+    /* Create a pipe for the child to return the info to the parent. */
+    ret = pipe(pipefd);
+    if (ret < 0) {
+        serverLog(LL_WARNING, "Failed to create pipe: %s", strerror(errno));
+        bug_found = -1;
+        goto exit;
+    }
+
+    /* Fork the process. */
+    pid = fork();
+    if (pid < 0) {
+        serverLog(LL_WARNING, "Failed to fork: %s", strerror(errno));
+        bug_found = -1;
+        goto exit;
+    } else if (!pid) {
+        /* Child: check if the page is marked as dirty, page_size in kb.
+         * A value of 0 means the kernel is affected by the bug. */
+        ret = smapsGetSharedDirty((unsigned long) q);
+        if (!ret)
+            bug_found = 1;
+        else if (ret == -1)     /* Failed to read */
+            bug_found = -1;
+
+        if (write(pipefd[1], &bug_found, sizeof(bug_found)) < 0)
+            serverLog(LL_WARNING, "Failed to write to parent: %s", strerror(errno));
+        exit(0);
+    } else {
+        /* Read the result from the child. */
+        ret = read(pipefd[0], &bug_found, sizeof(bug_found));
+        if (ret < 0) {
+            serverLog(LL_WARNING, "Failed to read from child: %s", strerror(errno));
+            bug_found = -1;
+        }
+
+        /* Reap the child pid. */
+        waitpid(pid, NULL, 0);
+    }
+
+exit:
+    /* Cleanup */
+    if (pipefd[0] != -1) close(pipefd[0]);
+    if (pipefd[1] != -1) close(pipefd[1]);
+    if (p != NULL) munmap(p, map_size);
+
+    return bug_found;
+}
+#endif /* __arm64__ */
 #endif /* __linux__ */
 
 void createPidFile(void) {
@@ -4847,7 +5043,7 @@ static void sigShutdownHandler(int sig) {
      * on disk. */
     if (server.shutdown_asap && sig == SIGINT) {
         serverLogFromHandler(LL_WARNING, "You insist... exiting now.");
-        rdbRemoveTempFile(getpid());
+        rdbRemoveTempFile(getpid(), 1);
         exit(1); /* Exit with an error since this was not a clean shutdown. */
     } else if (server.loading) {
         serverLogFromHandler(LL_WARNING, "Received shutdown signal during loading, exiting now.");
@@ -4887,7 +5083,8 @@ void setupSignalHandlers(void) {
  * accepting writes because of a write error condition. */
 static void sigKillChildHandler(int sig) {
     UNUSED(sig);
-    serverLogFromHandler(LL_WARNING, "Received SIGUSR1 in child, exiting now.");
+    int level = server.in_fork_child == CHILD_TYPE_MODULE? LL_VERBOSE: LL_WARNING;
+    serverLogFromHandler(level, "Received SIGUSR1 in child, exiting now.");
     exitFromChild(SERVER_CHILD_NOERROR_RETVAL);
 }
 
@@ -4911,15 +5108,23 @@ void closeClildUnusedResourceAfterFork() {
     closeListeningSockets(0);
     if (server.cluster_enabled && server.cluster_config_file_lock_fd != -1)
         close(server.cluster_config_file_lock_fd);  /* don't care if this fails */
+
+    /* Clear server.pidfile, this is the parent pidfile which should not
+     * be touched (or deleted) by the child (on exit / crash) */
+    zfree(server.pidfile);
+    server.pidfile = NULL;
 }
 
-int redisFork() {
+/* purpose is one of CHILD_TYPE_ types */
+int redisFork(int purpose) {
     int childpid;
     long long start = ustime();
     if ((childpid = fork()) == 0) {
         /* Child */
+        server.in_fork_child = purpose;
         setOOMScoreAdj(CONFIG_OOM_BGCHILD);
         setupChildSignalHandlers();
+        updateDictResizePolicy();
         closeClildUnusedResourceAfterFork();
     } else {
         /* Parent */
@@ -4929,7 +5134,6 @@ int redisFork() {
         if (childpid == -1) {
             return -1;
         }
-        updateDictResizePolicy();
     }
     return childpid;
 }
@@ -5093,7 +5297,6 @@ int iAmMaster(void) {
             (server.cluster_enabled && nodeIsMaster(server.cluster->myself)));
 }
 
-
 int main(int argc, char **argv) {
     struct timeval tv;
     int j;
@@ -5133,7 +5336,14 @@ int main(int argc, char **argv) {
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     srand(time(NULL)^getpid());
     gettimeofday(&tv,NULL);
+    init_genrand64(((long long) tv.tv_sec * 1000000 + tv.tv_usec) ^ getpid());
     crc64_init();
+
+    /* Store umask value. Because umask(2) only offers a set-and-get API we have
+     * to reset it and restore it back. We do this early to avoid a potential
+     * race condition with threads that could be creating files or directories.
+     */
+    umask(server.umask = umask(0777));
 
     uint8_t hashseed[16];
     getRandomBytes(hashseed,sizeof(hashseed));
@@ -5265,7 +5475,23 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING,"Server initialized");
     #ifdef __linux__
         linuxMemoryWarnings();
-    #endif
+    #if defined (__arm64__)
+        int ret;
+        if ((ret = linuxMadvFreeForkBugCheck())) {
+            if (ret == 1)
+                serverLog(LL_WARNING,"WARNING Your kernel has a bug that could lead to data corruption during background save. "
+                                     "Please upgrade to the latest stable kernel.");
+            else
+                serverLog(LL_WARNING, "Failed to test the kernel for a bug that could lead to data corruption during background save. "
+                                      "Your system could be affected, please report this error.");
+            if (!checkIgnoreWarning("ARM64-COW-BUG")) {
+                serverLog(LL_WARNING,"Redis will now exit to prevent data corruption. "
+                                     "Note that it is possible to suppress this warning by setting the following config: ignore-warnings ARM64-COW-BUG");
+                exit(1);
+            }
+        }
+    #endif /* __arm64__ */
+    #endif /* __linux__ */
         moduleLoadFromQueue();
         ACLLoadUsersAtStartup();
         InitServerLast();

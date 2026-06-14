@@ -1,5 +1,5 @@
 #!/bin/sh
-TCL_VERSIONS="8.5 8.6"
+TCL_VERSIONS="8.5 8.6 8.7"
 TCLSH=""
 
 for VERSION in $TCL_VERSIONS; do
@@ -27,4 +27,6 @@ $TCLSH tests/test_helper.tcl \
 --single unit/moduleapi/auth \
 --single unit/moduleapi/keyspace_events \
 --single unit/moduleapi/blockedclient \
+--single unit/moduleapi/getkeys \
+--single unit/moduleapi/zset \
 "${@}"

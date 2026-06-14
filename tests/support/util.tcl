@@ -109,7 +109,23 @@ proc wait_done_loading r {
 
 # count current log lines in server's stdout
 proc count_log_lines {srv_idx} {
-    set _ [exec wc -l < [srv $srv_idx stdout]]
+    set _ [string trim [exec wc -l < [srv $srv_idx stdout]]]
+}
+
+# returns the number of times a line with that pattern appears in a file
+proc count_message_lines {file pattern} {
+    set res 0
+    # exec fails when grep exists with status other than 0 (when the patter wasn't found)
+    catch {
+        set res [string trim [exec grep $pattern $file 2> /dev/null | wc -l]]
+    }
+    return $res
+}
+
+# returns the number of times a line with that pattern appears in the log
+proc count_log_message {srv_idx pattern} {
+    set stdout [srv $srv_idx stdout]
+    return [count_message_lines $stdout $pattern]
 }
 
 # verify pattern exists in server's sdtout after a certain line number
@@ -128,6 +144,8 @@ proc wait_for_log_messages {srv_idx patterns from_line maxtries delay} {
     set next_line [expr $from_line + 1] ;# searching form the line after
     set stdout [srv $srv_idx stdout]
     while {$retry} {
+        # re-read the last line (unless it's before to our first), last time we read it, it might have been incomplete
+        set next_line [expr $next_line - 1 > $from_line + 1 ? $next_line - 1 : $from_line + 1]
         set result [exec tail -n +$next_line < $stdout]
         set result [split $result "\n"]
         foreach line $result {
@@ -142,6 +160,10 @@ proc wait_for_log_messages {srv_idx patterns from_line maxtries delay} {
         after $delay
     }
     if {$retry == 0} {
+        if {$::verbose} {
+            puts "content of $stdout from line: $from_line:"
+            puts [exec tail -n +$from_line < $stdout]
+        }
         fail "log message of '$patterns' not found in $stdout after line: $from_line till line: [expr $next_line -1]"
     }
 }
@@ -508,7 +530,7 @@ proc populate {num prefix size} {
 
 proc get_child_pid {idx} {
     set pid [srv $idx pid]
-    if {[string match {*Darwin*} [exec uname -a]]} {
+    if {[file exists "/usr/bin/pgrep"]} {
         set fd [open "|pgrep -P $pid" "r"]
         set child_pid [string trim [lindex [split [read $fd] \n] 0]]
     } else {
@@ -519,3 +541,34 @@ proc get_child_pid {idx} {
 
     return $child_pid
 }
+
+proc config_set {param value {options {}}} {
+    set mayfail 0
+    foreach option $options {
+        switch $option {
+            "mayfail" {
+                set mayfail 1
+            }
+            default {
+                error "Unknown option $option"
+            }
+        }
+    }
+
+    if {[catch {r config set $param $value} err]} {
+        if {!$mayfail} {
+            error $err
+        } else {
+            if {$::verbose} {
+                puts "Ignoring CONFIG SET $param $value failure: $err"
+            }
+        }
+    }
+}
+
+proc config_get_set {param value {options {}}} {
+    set config [lindex [r config get $param] 1]
+    config_set $param $value $options
+    return $config
+}
+

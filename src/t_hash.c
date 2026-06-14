@@ -39,17 +39,22 @@
  * as their string length can be queried in constant time. */
 void hashTypeTryConversion(robj *o, robj **argv, int start, int end) {
     int i;
+    size_t sum = 0;
 
     if (o->encoding != OBJ_ENCODING_ZIPLIST) return;
 
     for (i = start; i <= end; i++) {
-        if (sdsEncodedObject(argv[i]) &&
-            sdslen(argv[i]->ptr) > server.hash_max_ziplist_value)
-        {
+        if (!sdsEncodedObject(argv[i]))
+            continue;
+        size_t len = sdslen(argv[i]->ptr);
+        if (len > server.hash_max_ziplist_value) {
             hashTypeConvert(o, OBJ_ENCODING_HT);
-            break;
+            return;
         }
+        sum += len;
     }
+    if (!ziplistSafeToAdd(o->ptr, sum))
+        hashTypeConvert(o, OBJ_ENCODING_HT);
 }
 
 /* Get the value from a ziplist encoded hash, identified by field.
@@ -600,6 +605,10 @@ void hincrbyfloatCommand(client *c) {
     unsigned int vlen;
 
     if (getLongDoubleFromObjectOrReply(c,c->argv[3],&incr,NULL) != C_OK) return;
+    if (isnan(incr) || isinf(incr)) {
+        addReplyError(c,"value is NaN or Infinity");
+        return;
+    }
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
     if (hashTypeGetValue(o,c->argv[2]->ptr,&vstr,&vlen,&ll) == C_OK) {
         if (vstr) {
@@ -630,7 +639,7 @@ void hincrbyfloatCommand(client *c) {
     server.dirty++;
 
     /* Always replicate HINCRBYFLOAT as an HSET command with the final value
-     * in order to make sure that differences in float pricision or formatting
+     * in order to make sure that differences in float precision or formatting
      * will not create differences in replicas or after an AOF restart. */
     robj *aux, *newobj;
     aux = createStringObject("HSET",4);

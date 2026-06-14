@@ -134,7 +134,7 @@ void enableTracking(client *c, uint64_t redirect_to, uint64_t options, robj **pr
                   CLIENT_TRACKING_NOLOOP);
     c->client_tracking_redirection = redirect_to;
 
-    /* This may be the first client we ever enable. Crete the tracking
+    /* This may be the first client we ever enable. Create the tracking
      * table if it does not exist. */
     if (TrackingTable == NULL) {
         TrackingTable = raxNew();
@@ -171,9 +171,14 @@ void trackingRememberKeys(client *c) {
     uint64_t caching_given = c->flags & CLIENT_TRACKING_CACHING;
     if ((optin && !caching_given) || (optout && caching_given)) return;
 
-    int numkeys;
-    int *keys = getKeysFromCommand(c->cmd,c->argv,c->argc,&numkeys);
-    if (keys == NULL) return;
+    getKeysResult result = GETKEYS_RESULT_INIT;
+    int numkeys = getKeysFromCommand(c->cmd,c->argv,c->argc,&result);
+    if (!numkeys) {
+        getKeysFreeResult(&result);
+        return;
+    }
+
+    int *keys = result.keys;
 
     for(int j = 0; j < numkeys; j++) {
         int idx = keys[j];
@@ -188,7 +193,7 @@ void trackingRememberKeys(client *c) {
         if (raxTryInsert(ids,(unsigned char*)&c->id,sizeof(c->id),NULL,NULL))
             TrackingTableTotalItems++;
     }
-    getKeysFreeResult(keys);
+    getKeysFreeResult(&result);
 }
 
 /* Given a key name, this function sends an invalidation message in the
@@ -204,6 +209,9 @@ void trackingRememberKeys(client *c) {
  * - Following a flush command, to send a single RESP NULL to indicate
  *   that all keys are now invalid. */
 void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
+    uint64_t old_flags = c->flags;
+    c->flags |= CLIENT_PUSHING;
+
     int using_redirection = 0;
     if (c->client_tracking_redirection) {
         client *redir = lookupClientByID(c->client_tracking_redirection);
@@ -213,14 +221,18 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
              * are unable to send invalidation messages to the redirected
              * connection, because the client no longer exist. */
             if (c->resp > 2) {
-                addReplyPushLen(c,3);
+                addReplyPushLen(c,2);
                 addReplyBulkCBuffer(c,"tracking-redir-broken",21);
                 addReplyLongLong(c,c->client_tracking_redirection);
             }
+            if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
             return;
         }
+        if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
         c = redir;
         using_redirection = 1;
+        old_flags = c->flags;
+        c->flags |= CLIENT_PUSHING;
     }
 
     /* Only send such info for clients in RESP version 3 or more. However
@@ -239,6 +251,7 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
          * redirecting to another client. We can't send anything to
          * it since RESP2 does not support push messages in the same
          * connection. */
+        if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
         return;
     }
 
@@ -249,6 +262,7 @@ void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
         addReplyArrayLen(c,1);
         addReplyBulkCBuffer(c,keyname,keylen);
     }
+    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
 /* This function is called when a key is modified in Redis and in the case
@@ -270,7 +284,7 @@ void trackingRememberKeyToBroadcast(client *c, char *keyname, size_t keylen) {
          * tree. This way we know who was the client that did the last
          * change to the key, and can avoid sending the notification in the
          * case the client is in NOLOOP mode. */
-        raxTryInsert(bs->keys,(unsigned char*)keyname,keylen,c,NULL);
+        raxInsert(bs->keys,(unsigned char*)keyname,keylen,c,NULL);
     }
     raxStop(&ri);
 }

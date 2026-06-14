@@ -387,7 +387,7 @@ void debugCommand(client *c) {
 "OOM -- Crash the server simulating an out-of-memory error.",
 "PANIC -- Crash the server simulating a panic.",
 "POPULATE <count> [prefix] [size] -- Create <count> string keys named key:<num>. If a prefix is specified is used instead of the 'key' prefix.",
-"RELOAD [MERGE] [NOFLUSH] [NOSAVE] -- Save the RDB on disk and reload it back in memory. By default it will save the RDB file and load it back. With the NOFLUSH option the current database is not removed before loading the new one, but conficts in keys will kill the server with an exception. When MERGE is used, conflicting keys will be loaded (the key in the loaded RDB file will win). When NOSAVE is used, the server will not save the current dataset in the RDB file before loading. Use DEBUG RELOAD NOSAVE when you want just to load the RDB file you placed in the Redis working directory in order to replace the current dataset in memory. Use DEBUG RELOAD NOSAVE NOFLUSH MERGE when you want to add what is in the current RDB file placed in the Redis current directory, with the current memory content. Use DEBUG RELOAD when you want to verify Redis is able to persist the current dataset in the RDB file, flush the memory content, and load it back.",
+"RELOAD [MERGE] [NOFLUSH] [NOSAVE] -- Save the RDB on disk and reload it back in memory. By default it will save the RDB file and load it back. With the NOFLUSH option the current database is not removed before loading the new one, but conflicts in keys will kill the server with an exception. When MERGE is used, conflicting keys will be loaded (the key in the loaded RDB file will win). When NOSAVE is used, the server will not save the current dataset in the RDB file before loading. Use DEBUG RELOAD NOSAVE when you want just to load the RDB file you placed in the Redis working directory in order to replace the current dataset in memory. Use DEBUG RELOAD NOSAVE NOFLUSH MERGE when you want to add what is in the current RDB file placed in the Redis current directory, with the current memory content. Use DEBUG RELOAD when you want to verify Redis is able to persist the current dataset in the RDB file, flush the memory content, and load it back.",
 "RESTART -- Graceful restart: save config, db, restart.",
 "SDSLEN <key> -- Show low level SDS string info representing key and value.",
 "SEGFAULT -- Crash the server with sigsegv.",
@@ -456,7 +456,7 @@ NULL
             }
         }
 
-        /* The default beahvior is to save the RDB file before loading
+        /* The default behavior is to save the RDB file before loading
          * it back. */
         if (save) {
             rdbSaveInfo rsi, *rsiptr;
@@ -631,7 +631,11 @@ NULL
         for (int j = 2; j < c->argc; j++) {
             unsigned char digest[20];
             memset(digest,0,20); /* Start with a clean result */
-            robj *o = lookupKeyReadWithFlags(c->db,c->argv[j],LOOKUP_NOTOUCH);
+
+            /* We don't use lookupKey because a debug command should
+             * work on logically expired keys */
+            dictEntry *de;
+            robj *o = ((de = dictFind(c->db->dict,c->argv[j]->ptr)) == NULL) ? NULL : dictGetVal(de);
             if (o) xorObjectDigest(c->db,c->argv[j],digest,o);
 
             sds d = sdsempty();
@@ -650,7 +654,7 @@ NULL
         } else if (!strcasecmp(name,"double")) {
             addReplyDouble(c,3.14159265359);
         } else if (!strcasecmp(name,"bignum")) {
-            addReplyProto(c,"(1234567999999999999999999999999999999\r\n",40);
+            addReplyBigNum(c,"1234567999999999999999999999999999999",37);
         } else if (!strcasecmp(name,"null")) {
             addReplyNull(c);
         } else if (!strcasecmp(name,"array")) {
@@ -666,18 +670,27 @@ NULL
                 addReplyBool(c, j == 1);
             }
         } else if (!strcasecmp(name,"attrib")) {
-            addReplyAttributeLen(c,1);
-            addReplyBulkCString(c,"key-popularity");
-            addReplyArrayLen(c,2);
-            addReplyBulkCString(c,"key:123");
-            addReplyLongLong(c,90);
+            if (c->resp >= 3) {
+                addReplyAttributeLen(c,1);
+                addReplyBulkCString(c,"key-popularity");
+                addReplyArrayLen(c,2);
+                addReplyBulkCString(c,"key:123");
+                addReplyLongLong(c,90);
+            }
             /* Attributes are not real replies, so a well formed reply should
              * also have a normal reply type after the attribute. */
             addReplyBulkCString(c,"Some real reply following the attribute");
         } else if (!strcasecmp(name,"push")) {
+            if (c->resp < 3) {
+                addReplyError(c,"RESP2 is not supported by this command");
+                return;
+            }
+            uint64_t old_flags = c->flags;
+            c->flags |= CLIENT_PUSHING;
             addReplyPushLen(c,2);
             addReplyBulkCString(c,"server-cpu-usage");
             addReplyLongLong(c,42);
+            if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
             /* Push replies are not synchronous replies, so we emit also a
              * normal reply in order for blocking clients just discarding the
              * push reply, to actually consume the reply and continue. */
@@ -942,7 +955,7 @@ static void *getMcontextEip(ucontext_t *uc) {
     #endif
 #elif defined(__linux__)
     /* Linux */
-    #if defined(__i386__) || defined(__ILP32__)
+    #if defined(__i386__) || ((defined(__X86_64__) || defined(__x86_64__)) && defined(__ILP32__))
     return (void*) uc->uc_mcontext.gregs[14]; /* Linux 32 */
     #elif defined(__X86_64__) || defined(__x86_64__)
     return (void*) uc->uc_mcontext.gregs[16]; /* Linux 64 */
@@ -966,6 +979,12 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->sc_eip;
     #elif defined(__x86_64__)
     return (void*) uc->sc_rip;
+    #endif
+#elif defined(__NetBSD__)
+    #if defined(__i386__)
+    return (void*) uc->uc_mcontext.__gregs[_REG_EIP];
+    #elif defined(__x86_64__)
+    return (void*) uc->uc_mcontext.__gregs[_REG_RIP];
     #endif
 #elif defined(__DragonFly__)
     return (void*) uc->uc_mcontext.mc_rip;
@@ -1103,7 +1122,7 @@ void logRegisters(ucontext_t *uc) {
 /* Linux */
 #elif defined(__linux__)
     /* Linux x86 */
-    #if defined(__i386__) || defined(__ILP32__)
+    #if defined(__i386__) || ((defined(__X86_64__) || defined(__x86_64__)) && defined(__ILP32__))
     serverLog(LL_WARNING,
     "\n"
     "EAX:%08lx EBX:%08lx ECX:%08lx EDX:%08lx\n"
@@ -1191,7 +1210,7 @@ void logRegisters(ucontext_t *uc) {
 	      "R10:%016lx R9 :%016lx\nR8 :%016lx R7 :%016lx\n"
 	      "R6 :%016lx R5 :%016lx\nR4 :%016lx R3 :%016lx\n"
 	      "R2 :%016lx R1 :%016lx\nR0 :%016lx EC :%016lx\n"
-	      "fp: %016lx ip:%016lx\n",
+	      "fp: %016lx ip:%016lx\n"
 	      "pc:%016lx sp:%016lx\ncpsr:%016lx fault_address:%016lx\n",
 	      (unsigned long) uc->uc_mcontext.arm_r10,
 	      (unsigned long) uc->uc_mcontext.arm_r9,
@@ -1324,6 +1343,59 @@ void logRegisters(ucontext_t *uc) {
     );
     logStackContent((void**)uc->sc_esp);
     #endif
+#elif defined(__NetBSD__)
+    #if defined(__x86_64__)
+    serverLog(LL_WARNING,
+    "\n"
+    "RAX:%016lx RBX:%016lx\nRCX:%016lx RDX:%016lx\n"
+    "RDI:%016lx RSI:%016lx\nRBP:%016lx RSP:%016lx\n"
+    "R8 :%016lx R9 :%016lx\nR10:%016lx R11:%016lx\n"
+    "R12:%016lx R13:%016lx\nR14:%016lx R15:%016lx\n"
+    "RIP:%016lx EFL:%016lx\nCSGSFS:%016lx",
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RAX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RBX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RCX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RDX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RDI],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RSI],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RBP],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RSP],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R8],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R9],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R10],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R11],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R12],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R13],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R14],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_R15],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RIP],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_RFLAGS],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_CS]
+    );
+    logStackContent((void**)uc->uc_mcontext.__gregs[_REG_RSP]);
+    #elif defined(__i386__)
+    serverLog(LL_WARNING,
+    "\n"
+    "EAX:%08lx EBX:%08lx ECX:%08lx EDX:%08lx\n"
+    "EDI:%08lx ESI:%08lx EBP:%08lx ESP:%08lx\n"
+    "SS :%08lx EFL:%08lx EIP:%08lx CS:%08lx\n"
+    "DS :%08lx ES :%08lx FS :%08lx GS:%08lx",
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EAX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EBX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EDX],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EDI],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_ESI],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EBP],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_ESP],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_SS],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EFLAGS],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_EIP],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_CS],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_ES],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_FS],
+        (unsigned long) uc->uc_mcontext.__gregs[_REG_GS]
+    );
+    #endif
 #elif defined(__DragonFly__)
     serverLog(LL_WARNING,
     "\n"
@@ -1430,7 +1502,7 @@ void logCurrentClient(void) {
     }
     /* Check if the first argument, usually a key, is found inside the
      * selected DB, and if so print info about the associated object. */
-    if (cc->argc >= 1) {
+    if (cc->argc > 1) {
         robj *val, *key;
         dictEntry *de;
 
@@ -1449,7 +1521,7 @@ void logCurrentClient(void) {
 
 #define MEMTEST_MAX_REGIONS 128
 
-/* A non destructive memory test executed during segfauls. */
+/* A non destructive memory test executed during segfault. */
 int memtest_test_linux_anonymous_maps(void) {
     FILE *fp;
     char line[1024];
@@ -1510,7 +1582,28 @@ int memtest_test_linux_anonymous_maps(void) {
     closeDirectLogFiledes(fd);
     return errors;
 }
-#endif
+#endif /* HAVE_PROC_MAPS */
+
+static void killMainThread(void) {
+    int err;
+    if (pthread_self() != server.main_thread_id && pthread_cancel(server.main_thread_id) == 0) {
+        if ((err = pthread_join(server.main_thread_id,NULL)) != 0) {
+            serverLog(LL_WARNING, "main thread can not be joined: %s", strerror(err));
+        } else {
+            serverLog(LL_WARNING, "main thread terminated");
+        }
+    }
+}
+
+/* Kill the running threads (other than current) in an unclean way. This function
+ * should be used only when it's critical to stop the threads for some reason.
+ * Currently Redis does this only on crash (for instance on SIGSEGV) in order
+ * to perform a fast memory check without other threads messing with memory. */
+void killThreads(void) {
+    killMainThread();
+    bioKillThreads();
+    killIOThreads();
+}
 
 /* Scans the (assumed) x86 code starting at addr, for a max of `len`
  * bytes, searching for E8 (callq) opcodes, and dumping the symbols
@@ -1547,7 +1640,7 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
 
     bugReportStart();
     serverLog(LL_WARNING,
-        "Redis %s crashed by signal: %d", REDIS_VERSION, sig);
+        "Redis %s crashed by signal: %d, si_code: %d", REDIS_VERSION, sig, info->si_code);
     if (eip != NULL) {
         serverLog(LL_WARNING,
         "Crashed running the instruction at: %p", eip);
@@ -1555,6 +1648,9 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     if (sig == SIGSEGV || sig == SIGBUS) {
         serverLog(LL_WARNING,
         "Accessing address: %p", (void*)info->si_addr);
+    }
+    if (info->si_code == SI_USER && info->si_pid != -1) {
+        serverLog(LL_WARNING, "Killed by PID: %ld, UID: %d", (long) info->si_pid, info->si_uid);
     }
     serverLog(LL_WARNING,
         "Failed assertion: %s (%s:%d)", server.assert_failed,
@@ -1589,7 +1685,7 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
 #if defined(HAVE_PROC_MAPS)
     /* Test memory */
     serverLogRaw(LL_WARNING|LL_RAW, "\n------ FAST MEMORY TEST ------\n");
-    bioKillThreads();
+    killThreads();
     if (memtest_test_linux_anonymous_maps()) {
         serverLogRaw(LL_WARNING|LL_RAW,
             "!!! MEMORY ERROR DETECTED! Check your memory ASAP !!!\n");
@@ -1617,13 +1713,14 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
                 /* Find the address of the next page, which is our "safety"
                  * limit when dumping. Then try to dump just 128 bytes more
                  * than EIP if there is room, or stop sooner. */
+                void *base = (void *)info.dli_saddr;
                 unsigned long next = ((unsigned long)eip + sz) & ~(sz-1);
                 unsigned long end = (unsigned long)eip + 128;
                 if (end > next) end = next;
-                len = end - (unsigned long)info.dli_saddr;
+                len = end - (unsigned long)base;
                 serverLogHexDump(LL_WARNING, "dump of function",
-                    info.dli_saddr ,len);
-                dumpX86Calls(info.dli_saddr,len);
+                    base ,len);
+                dumpX86Calls(base,len);
             }
         }
     }
@@ -1632,11 +1729,13 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
 "\n=== REDIS BUG REPORT END. Make sure to include from START to END. ===\n\n"
 "       Please report the crash by opening an issue on github:\n\n"
 "           http://github.com/redis/redis/issues\n\n"
+"  If a Redis module was involved, please open in the module's repo instead.\n\n"
 "  Suspect RAM error? Use redis-server --test-memory to verify it.\n\n"
+"  Some other issues could be detected by redis-server --check-system\n"
 );
 
     /* free(messages); Don't call free() with possibly corrupted memory. */
-    if (server.daemonize && server.supervised == 0) unlink(server.pidfile);
+    if (server.daemonize && server.supervised == 0 && server.pidfile) unlink(server.pidfile);
 
     /* Make sure we exit with the right signal at the end. So for instance
      * the core will be dumped if enabled. */

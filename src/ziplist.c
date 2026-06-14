@@ -99,7 +99,7 @@
  *      Integer encoded as 24 bit signed (3 bytes).
  * |11111110| - 2 bytes
  *      Integer encoded as 8 bit signed (1 byte).
- * |1111xxxx| - (with xxxx between 0000 and 1101) immediate 4 bit integer.
+ * |1111xxxx| - (with xxxx between 0001 and 1101) immediate 4 bit integer.
  *      Unsigned integer from 0 to 12. The encoded value is actually from
  *      1 to 13 because 0000 and 1111 can not be used, so 1 should be
  *      subtracted from the encoded 4 bit value to obtain the right value.
@@ -191,10 +191,10 @@
 #include "redisassert.h"
 
 #define ZIP_END 255         /* Special "end of ziplist" entry. */
-#define ZIP_BIG_PREVLEN 254 /* Max number of bytes of the previous entry, for
-                               the "prevlen" field prefixing each entry, to be
-                               represented with just a single byte. Otherwise
-                               it is represented as FE AA BB CC DD, where
+#define ZIP_BIG_PREVLEN 254 /* ZIP_BIG_PREVLEN - 1 is the max number of bytes of
+                               the previous entry, for the "prevlen" field prefixing
+                               each entry, to be represented with just a single byte.
+                               Otherwise it is represented as FE AA BB CC DD, where
                                AA BB CC DD are a 4 bytes unsigned integer
                                representing the previous entry len. */
 
@@ -261,9 +261,20 @@
  * to stay there to signal that a full scan is needed to get the number of
  * items inside the ziplist. */
 #define ZIPLIST_INCR_LENGTH(zl,incr) { \
-    if (ZIPLIST_LENGTH(zl) < UINT16_MAX) \
+    if (intrev16ifbe(ZIPLIST_LENGTH(zl)) < UINT16_MAX) \
         ZIPLIST_LENGTH(zl) = intrev16ifbe(intrev16ifbe(ZIPLIST_LENGTH(zl))+incr); \
 }
+
+/* Don't let ziplists grow over 1GB in any case, don't wanna risk overflow in
+ * zlbytes*/
+#define ZIPLIST_MAX_SAFETY_SIZE (1<<30)
+int ziplistSafeToAdd(unsigned char* zl, size_t add) {
+    size_t len = zl? ziplistBlobLen(zl): 0;
+    if (len + add > ZIPLIST_MAX_SAFETY_SIZE)
+        return 0;
+    return 1;
+}
+
 
 /* We use this function to receive information about a ziplist entry.
  * Note that this is not how the data is actually encoded, is just what we
@@ -317,7 +328,7 @@ unsigned int zipIntSize(unsigned char encoding) {
     return 0;
 }
 
-/* Write the encoidng header of the entry in 'p'. If p is NULL it just returns
+/* Write the encoding header of the entry in 'p'. If p is NULL it just returns
  * the amount of bytes required to encode such a length. Arguments:
  *
  * 'encoding' is the encoding we are using for the entry. It could be
@@ -325,7 +336,7 @@ unsigned int zipIntSize(unsigned char encoding) {
  * for single-byte small immediate integers.
  *
  * 'rawlen' is only used for ZIP_STR_* encodings and is the length of the
- * srting that this entry represents.
+ * string that this entry represents.
  *
  * The function returns the number of bytes used by the encoding/length
  * header stored in 'p'. */
@@ -379,10 +390,10 @@ unsigned int zipStoreEntryEncoding(unsigned char *p, unsigned char encoding, uns
             (len) = (((ptr)[0] & 0x3f) << 8) | (ptr)[1];                       \
         } else if ((encoding) == ZIP_STR_32B) {                                \
             (lensize) = 5;                                                     \
-            (len) = ((ptr)[1] << 24) |                                         \
-                    ((ptr)[2] << 16) |                                         \
-                    ((ptr)[3] <<  8) |                                         \
-                    ((ptr)[4]);                                                \
+            (len) = ((uint32_t)(ptr)[1] << 24) |                               \
+                    ((uint32_t)(ptr)[2] << 16) |                               \
+                    ((uint32_t)(ptr)[3] <<  8) |                               \
+                    ((uint32_t)(ptr)[4]);                                      \
         } else {                                                               \
             panic("Invalid string encoding 0x%02X", (encoding));               \
         }                                                                      \
@@ -390,7 +401,7 @@ unsigned int zipStoreEntryEncoding(unsigned char *p, unsigned char encoding, uns
         (lensize) = 1;                                                         \
         (len) = zipIntSize(encoding);                                          \
     }                                                                          \
-} while(0);
+} while(0)
 
 /* Encode the length of the previous entry and write it to "p". This only
  * uses the larger encoding (required in __ziplistCascadeUpdate). */
@@ -426,7 +437,7 @@ unsigned int zipStorePrevEntryLength(unsigned char *p, unsigned int len) {
     } else {                                                                   \
         (prevlensize) = 5;                                                     \
     }                                                                          \
-} while(0);
+} while(0)
 
 /* Return the length of the previous element, and the number of bytes that
  * are used in order to encode the previous element length.
@@ -444,7 +455,7 @@ unsigned int zipStorePrevEntryLength(unsigned char *p, unsigned int len) {
         memcpy(&(prevlen), ((char*)(ptr)) + 1, 4);                             \
         memrev32ifbe(&prevlen);                                                \
     }                                                                          \
-} while(0);
+} while(0)
 
 /* Given a pointer 'p' to the prevlen info that prefixes an entry, this
  * function returns the difference in number of bytes needed to encode
@@ -515,7 +526,7 @@ void zipSaveInteger(unsigned char *p, int64_t value, unsigned char encoding) {
         memcpy(p,&i16,sizeof(i16));
         memrev16ifbe(p);
     } else if (encoding == ZIP_INT_24B) {
-        i32 = value<<8;
+        i32 = ((uint64_t)value)<<8;
         memrev32ifbe(&i32);
         memcpy(p,((uint8_t*)&i32)+1,sizeof(i32)-sizeof(uint8_t));
     } else if (encoding == ZIP_INT_32B) {
@@ -586,7 +597,8 @@ unsigned char *ziplistNew(void) {
 }
 
 /* Resize the ziplist. */
-unsigned char *ziplistResize(unsigned char *zl, unsigned int len) {
+unsigned char *ziplistResize(unsigned char *zl, size_t len) {
+    assert(len < UINT32_MAX);
     zl = zrealloc(zl,len);
     ZIPLIST_BYTES(zl) = intrev32ifbe(len);
     zl[len-1] = ZIP_END;
@@ -898,6 +910,9 @@ unsigned char *ziplistMerge(unsigned char **first, unsigned char **second) {
     /* Combined zl length should be limited within UINT16_MAX */
     zllength = zllength < UINT16_MAX ? zllength : UINT16_MAX;
 
+    /* larger values can't be stored into ZIPLIST_BYTES */
+    assert(zlbytes < UINT32_MAX);
+
     /* Save offset positions before we start ripping memory apart. */
     size_t first_offset = intrev32ifbe(ZIPLIST_TAIL_OFFSET(*first));
     size_t second_offset = intrev32ifbe(ZIPLIST_TAIL_OFFSET(*second));
@@ -914,7 +929,7 @@ unsigned char *ziplistMerge(unsigned char **first, unsigned char **second) {
     } else {
         /* !append == prepending to target */
         /* Move target *contents* exactly size of (source - [END]),
-         * then copy source into vacataed space (source - [END]):
+         * then copy source into vacated space (source - [END]):
          *   [SOURCE - END, TARGET - HEADER] */
         memmove(target + source_bytes - ZIPLIST_END_SIZE,
                 target + ZIPLIST_HEADER_SIZE,

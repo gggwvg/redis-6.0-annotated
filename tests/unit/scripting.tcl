@@ -215,6 +215,66 @@ start_server {tags {"scripting"}} {
         } 0
     } {a b}
 
+    test {EVAL - JSON smoke test} {
+        r eval {
+            local some_map = {
+                s1="Some string",
+                n1=100,
+                a1={"Some","String","Array"},
+                nil1=nil,
+                b1=true,
+                b2=false}
+            local encoded = cjson.encode(some_map)
+            local decoded = cjson.decode(encoded)
+            assert(table.concat(some_map) == table.concat(decoded))
+
+            cjson.encode_keep_buffer(false)
+            encoded = cjson.encode(some_map)
+            decoded = cjson.decode(encoded)
+            assert(table.concat(some_map) == table.concat(decoded))
+
+            -- Table with numeric keys
+            local table1 = {one="one", [1]="one"}
+            encoded = cjson.encode(table1)
+            decoded = cjson.decode(encoded)
+            assert(decoded["one"] == table1["one"])
+            assert(decoded["1"] == table1[1])
+
+            -- Array
+            local array1 = {[1]="one", [2]="two"}
+            encoded = cjson.encode(array1)
+            decoded = cjson.decode(encoded)
+            assert(table.concat(array1) == table.concat(decoded))
+
+            -- Invalid keys
+            local invalid_map = {}
+            invalid_map[false] = "false"
+            local ok, encoded = pcall(cjson.encode, invalid_map)
+            assert(ok == false)
+
+            -- Max depth
+            cjson.encode_max_depth(1)
+            ok, encoded = pcall(cjson.encode, some_map)
+            assert(ok == false)
+
+            cjson.decode_max_depth(1)
+            ok, decoded = pcall(cjson.decode, '{"obj": {"array": [1,2,3,4]}}')
+            assert(ok == false)
+
+            -- Invalid numbers
+            ok, encoded = pcall(cjson.encode, {num1=0/0})
+            assert(ok == false)
+            cjson.encode_invalid_numbers(true)
+            ok, encoded = pcall(cjson.encode, {num1=0/0})
+            assert(ok == true)
+
+            -- Restore defaults
+            cjson.decode_max_depth(1000)
+            cjson.encode_max_depth(1000)
+            cjson.encode_invalid_numbers(false)
+        } 0
+    }
+
     test {EVAL - cmsgpack can pack double?} {
         r eval {local encoded = cmsgpack.pack(0.1)
                 local h = ""
@@ -234,6 +294,68 @@ start_server {tags {"scripting"}} {
                 return h
         } 0
     } {d3ffffff0000000000}
+
+    test {EVAL - cmsgpack pack/unpack smoke test} {
+        r eval {
+                local str_lt_32 = string.rep("x", 30)
+                local str_lt_255 = string.rep("x", 250)
+                local str_lt_65535 = string.rep("x", 65530)
+                local str_long = string.rep("x", 100000)
+                local array_lt_15 = {1, 2, 3, 4, 5}
+                local array_lt_65535 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18}
+                local array_big = {}
+                for i=1, 100000 do
+                    array_big[i] = i
+                end
+                local map_lt_15 = {a=1, b=2}
+                local map_big = {}
+                for i=1, 100000 do
+                    map_big[tostring(i)] = i
+                end
+                local some_map = {
+                    s1=str_lt_32,
+                    s2=str_lt_255,
+                    s3=str_lt_65535,
+                    s4=str_long,
+                    d1=0.1,
+                    i1=1,
+                    i2=250,
+                    i3=65530,
+                    i4=100000,
+                    i5=2^40,
+                    i6=-1,
+                    i7=-120,
+                    i8=-32000,
+                    i9=-100000,
+                    i10=-3147483648,
+                    a1=array_lt_15,
+                    a2=array_lt_65535,
+                    a3=array_big,
+                    m1=map_lt_15,
+                    m2=map_big,
+                    b1=false,
+                    b2=true,
+                    n=nil
+                }
+                local encoded = cmsgpack.pack(some_map)
+                local decoded = cmsgpack.unpack(encoded)
+                assert(table.concat(some_map) == table.concat(decoded))
+                local offset, decoded_one = cmsgpack.unpack_one(encoded, 0)
+                assert(table.concat(some_map) == table.concat(decoded_one))
+                assert(offset == -1)
+
+                local encoded_multiple = cmsgpack.pack(str_lt_32, str_lt_255, str_lt_65535, str_long)
+                local offset, obj = cmsgpack.unpack_limit(encoded_multiple, 1, 0)
+                assert(obj == str_lt_32)
+                offset, obj = cmsgpack.unpack_limit(encoded_multiple, 1, offset)
+                assert(obj == str_lt_255)
+                offset, obj = cmsgpack.unpack_limit(encoded_multiple, 1, offset)
+                assert(obj == str_lt_65535)
+                offset, obj = cmsgpack.unpack_limit(encoded_multiple, 1, offset)
+                assert(obj == str_long)
+                assert(offset == -1)
+        } 0
+    }
 
     test {EVAL - cmsgpack can pack and unpack circular references?} {
         r eval {local a = {x=nil,y=5}
@@ -396,6 +518,7 @@ start_server {tags {"scripting"}} {
     }
 
     test {EVAL does not leak in the Lua stack} {
+        r script flush ;# reset Lua VM
         r set x 0
         # Use a non blocking client to speedup the loop.
         set rd [redis_deferring_client]
@@ -429,6 +552,45 @@ start_server {tags {"scripting"}} {
         r slaveof no one
         set res
     } {102}
+
+    test {EVAL timeout from AOF} {
+        # generate a long running script that is propagated to the AOF as script
+        # make sure that the script times out during loading
+        r config set appendonly no
+        r config set aof-use-rdb-preamble no
+        r config set lua-replicate-commands no
+        r flushall
+        r config set appendonly yes
+        wait_for_condition 50 100 {
+            [s aof_rewrite_in_progress] == 0
+        } else {
+            fail "AOF rewrite can't complete after CONFIG SET appendonly yes."
+        }
+        r config set lua-time-limit 1
+        set rd [redis_deferring_client]
+        set start [clock clicks -milliseconds]
+        $rd eval {redis.call('set',KEYS[1],'y'); for i=1,1500000 do redis.call('ping') end return 'ok'} 1 x
+        $rd flush
+        after 100
+        catch {r ping} err
+        assert_match {BUSY*} $err
+        $rd read
+        set elapsed [expr [clock clicks -milliseconds]-$start]
+        if {$::verbose} { puts "script took $elapsed milliseconds" }
+        set start [clock clicks -milliseconds]
+        $rd debug loadaof
+        $rd flush
+        after 100
+        catch {r ping} err
+        assert_match {LOADING*} $err
+        $rd read
+        set elapsed [expr [clock clicks -milliseconds]-$start]
+        if {$::verbose} { puts "loading took $elapsed milliseconds" }
+        $rd close
+        r get x
+    } {y}
+    r config set aof-use-rdb-preamble yes
+    r config set lua-replicate-commands yes
 
     test {We can call scripts rewriting client->argv from Lua} {
         r del myset
@@ -494,6 +656,40 @@ start_server {tags {"scripting"}} {
         } e
         set e
     } {*wrong number*}
+
+    test {Script with RESP3 map} {
+        set expected_dict [dict create field value]
+        set expected_list [list field value]
+
+        # Sanity test for RESP3 without scripts
+        r HELLO 3
+        r hset hash field value
+        set res [r hgetall hash]
+        assert_equal $res $expected_dict
+
+        # Test RESP3 client with script in both RESP2 and RESP3 modes
+        set res [r eval {redis.setresp(3); return redis.call('hgetall', KEYS[1])} 1 hash]
+        assert_equal $res $expected_dict
+        set res [r eval {redis.setresp(2); return redis.call('hgetall', KEYS[1])} 1 hash]
+        assert_equal $res $expected_list
+
+        # Test RESP2 client with script in both RESP2 and RESP3 modes
+        r HELLO 2
+        set res [r eval {redis.setresp(3); return redis.call('hgetall', KEYS[1])} 1 hash]
+        assert_equal $res $expected_list
+        set res [r eval {redis.setresp(2); return redis.call('hgetall', KEYS[1])} 1 hash]
+        assert_equal $res $expected_list
+    }
+
+    test {Script check unpack with massive arguments} {
+        r eval {
+            local a = {}
+            for i=1,7999 do
+                a[i] = 1
+            end 
+            return redis.call("lpush", "l", unpack(a))
+        } 0
+    } {7999}
 }
 
 # Start a new server since the last test in this stanza will kill the
@@ -533,7 +729,7 @@ start_server {tags {"scripting"}} {
     # Note: keep this test at the end of this server stanza because it
     # kills the server.
     test {SHUTDOWN NOSAVE can kill a timedout script anyway} {
-        # The server could be still unresponding to normal commands.
+        # The server should be still unresponding to normal commands.
         catch {r ping} e
         assert_match {BUSY*} $e
         catch {r shutdown nosave}
@@ -756,4 +952,19 @@ start_server {tags {"scripting"}} {
     r script debug sync
     r eval {return 'hello'} 0
     r eval {return 'hello'} 0
+}
+
+start_server {tags {"scripting needs:debug external:skip"}} {
+    test {Test scripting debug protocol parsing} {
+        r script debug sync
+        r eval {return 'hello'} 0
+        catch {r 'hello\0world'} e
+        assert_match {*Unknown Redis Lua debugger command*} $e
+        catch {r 'hello\0'} e
+        assert_match {*Unknown Redis Lua debugger command*} $e
+        catch {r '\0hello'} e
+        assert_match {*Unknown Redis Lua debugger command*} $e
+        catch {r '\0hello\0'} e
+        assert_match {*Unknown Redis Lua debugger command*} $e
+    }
 }

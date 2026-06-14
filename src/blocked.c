@@ -53,7 +53,7 @@
  * to 0, no timeout is processed).
  * It usually just needs to send a reply to the client.
  *
- * When implementing a new type of blocking opeation, the implementation
+ * When implementing a new type of blocking operation, the implementation
  * should modify unblockClient() and replyToBlockedClientTimedOut() in order
  * to handle the btype-specific behavior of this two functions.
  * If the blocking operation waits for certain keys to change state, the
@@ -98,6 +98,9 @@ void processUnblockedClients(void) {
     client *c;
 
     while (listLength(server.unblocked_clients)) {
+        /* If clients are paused we yield for now, since
+         * we don't want to process any commands later. */
+        if (clientsArePaused()) return;
         ln = listFirst(server.unblocked_clients);
         serverAssert(ln != NULL);
         c = ln->value;
@@ -109,6 +112,11 @@ void processUnblockedClients(void) {
          * client is not blocked before to proceed, but things may change and
          * the code is conceptually more correct this way. */
         if (!(c->flags & CLIENT_BLOCKED)) {
+            /* If we have a queued command, execute it now. */
+            if (processPendingCommandsAndResetClient(c) == C_ERR) {
+                continue;
+            }
+            /* Then process client if it has more data in it's buffer. */
             if (c->querybuf && sdslen(c->querybuf) > 0) {
                 processInputBuffer(c);
             }
@@ -118,7 +126,7 @@ void processUnblockedClients(void) {
 
 /* This function will schedule the client for reprocessing at a safe time.
  *
- * This is useful when a client was blocked for some reason (blocking opeation,
+ * This is useful when a client was blocked for some reason (blocking operation,
  * CLIENT PAUSE, or whatever), because it may end with some accumulated query
  * buffer that needs to be processed ASAP:
  *
@@ -417,6 +425,10 @@ void serveClientsBlockedOnStreamKey(robj *o, readyList *rl) {
 void serveClientsBlockedOnKeyByModule(readyList *rl) {
     dictEntry *de;
 
+    /* Optimization: If no clients are in type BLOCKED_MODULE,
+     * we can skip this loop. */
+    if (!server.blocked_clients_by_type[BLOCKED_MODULE]) return;
+
     /* We serve clients in the same order they blocked for
      * this key, from the first blocked to the last. */
     de = dictFind(rl->db->blocking_keys,rl->key);
@@ -500,7 +512,7 @@ void handleClientsBlockedOnKeys(void) {
             server.fixed_time_expire++;
             updateCachedTime(0);
 
-            /* Serve clients blocked on list key. */
+            /* Serve clients blocked on the key. */
             robj *o = lookupKeyWrite(rl->db,rl->key);
 
             if (o != NULL) {

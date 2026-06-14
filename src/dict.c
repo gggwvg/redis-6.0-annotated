@@ -51,15 +51,15 @@
 #include <assert.h>
 #endif
 
-/* Using dictEnableResize() / dictDisableResize() we make possible to
- * enable/disable resizing of the hash table as needed. This is very important
+/* Using dictEnableResize() / dictDisableResize() we make possible to disable
+ * resizing and rehashing of the hash table as needed. This is very important
  * for Redis, as we use copy-on-write and don't want to move too much memory
  * around when there is a child performing saving operations.
  *
  * Note that even when dict_can_resize is set to 0, not all resizes are
  * prevented: a hash table is still allowed to grow if the ratio between
  * the number of elements and the buckets > dict_force_resize_ratio. */
-static int dict_can_resize = 1;
+static dictResizeEnable dict_can_resize = DICT_RESIZE_ENABLE;
 static unsigned int dict_force_resize_ratio = 5;
 
 /* -------------------------- private prototypes ---------------------------- */
@@ -136,7 +136,7 @@ int dictResize(dict *d)
 {
     unsigned long minimal;
 
-    if (!dict_can_resize || dictIsRehashing(d)) return DICT_ERR;
+    if (dict_can_resize != DICT_RESIZE_ENABLE || dictIsRehashing(d)) return DICT_ERR;
     minimal = d->ht[0].used;
     if (minimal < DICT_HT_INITIAL_SIZE)
         minimal = DICT_HT_INITIAL_SIZE;
@@ -187,7 +187,15 @@ int dictExpand(dict *d, unsigned long size)
  * work it does would be unbound and the function may block for a long time. */
 int dictRehash(dict *d, int n) {
     int empty_visits = n*10; /* Max number of empty buckets to visit. */
-    if (!dictIsRehashing(d)) return 0;
+    unsigned long s0 = d->ht[0].size;
+    unsigned long s1 = d->ht[1].size;
+    if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
+    if (dict_can_resize == DICT_RESIZE_AVOID && 
+        ((s1 > s0 && s1 / s0 < dict_force_resize_ratio) ||
+         (s1 < s0 && s0 / s1 < dict_force_resize_ratio)))
+    {
+        return 0;
+    }
 
     while(n-- && d->ht[0].used != 0) {
         dictEntry *de, *nextde;
@@ -237,7 +245,9 @@ long long timeInMilliseconds(void) {
     return (((long long)tv.tv_sec)*1000)+(tv.tv_usec/1000);
 }
 
-/* Rehash for an amount of time between ms milliseconds and ms+1 milliseconds */
+/* Rehash in ms+"delta" milliseconds. The value of "delta" is larger 
+ * than 0, and is smaller than 1 in most cases. The exact upper bound 
+ * depends on the running time of dictRehash(d,100).*/
 int dictRehashMilliseconds(dict *d, int ms) {
     long long start = timeInMilliseconds();
     int rehashes = 0;
@@ -507,8 +517,8 @@ void *dictFetchValue(dict *d, const void *key) {
  * the fingerprint again when the iterator is released.
  * If the two fingerprints are different it means that the user of the iterator
  * performed forbidden operations against the dictionary while iterating. */
-long long dictFingerprint(dict *d) {
-    long long integers[6], hash = 0;
+unsigned long long dictFingerprint(dict *d) {
+    unsigned long long integers[6], hash = 0;
     int j;
 
     integers[0] = (long) d->ht[0].table;
@@ -619,15 +629,13 @@ dictEntry *dictGetRandomKey(dict *d)
         do {
             /* We are sure there are no elements in indexes from 0
              * to rehashidx-1 */
-            h = d->rehashidx + (random() % (d->ht[0].size +
-                                            d->ht[1].size -
-                                            d->rehashidx));
+            h = d->rehashidx + (randomULong() % (dictSlots(d) - d->rehashidx));
             he = (h >= d->ht[0].size) ? d->ht[1].table[h - d->ht[0].size] :
                                       d->ht[0].table[h];
         } while(he == NULL);
     } else {
         do {
-            h = random() & d->ht[0].sizemask;
+            h = randomULong() & d->ht[0].sizemask;
             he = d->ht[0].table[h];
         } while(he == NULL);
     }
@@ -693,7 +701,7 @@ unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count) {
         maxsizemask = d->ht[1].sizemask;
 
     /* Pick a random point inside the larger table. */
-    unsigned long i = random() & maxsizemask;
+    unsigned long i = randomULong() & maxsizemask;
     unsigned long emptylen = 0; /* Continuous empty entries so far. */
     while(stored < count && maxsteps--) {
         for (j = 0; j < tables; j++) {
@@ -718,7 +726,7 @@ unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count) {
             if (he == NULL) {
                 emptylen++;
                 if (emptylen >= 5 && emptylen > count) {
-                    i = random() & maxsizemask;
+                    i = randomULong() & maxsizemask;
                     emptylen = 0;
                 }
             } else {
@@ -749,7 +757,7 @@ unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count) {
  * this function instead what we do is to consider a "linear" range of the table
  * that may be constituted of N buckets with chains of different lengths
  * appearing one after the other. Then we report a random element in the range.
- * In this way we smooth away the problem of different chain lenghts. */
+ * In this way we smooth away the problem of different chain lengths. */
 #define GETFAIR_NUM_ENTRIES 15
 dictEntry *dictGetFairRandomKey(dict *d) {
     dictEntry *entries[GETFAIR_NUM_ENTRIES];
@@ -962,9 +970,10 @@ static int _dictExpandIfNeeded(dict *d)
      * table (global setting) or we should avoid it but the ratio between
      * elements/buckets is over the "safe" threshold, we resize doubling
      * the number of buckets. */
-    if (d->ht[0].used >= d->ht[0].size &&
-        (dict_can_resize ||
-         d->ht[0].used/d->ht[0].size > dict_force_resize_ratio))
+    if ((dict_can_resize == DICT_RESIZE_ENABLE &&
+         d->ht[0].used >= d->ht[0].size) ||
+        (dict_can_resize != DICT_RESIZE_FORBID &&
+         d->ht[0].used / d->ht[0].size > dict_force_resize_ratio))
     {
         return dictExpand(d, d->ht[0].used*2);
     }
@@ -1023,12 +1032,8 @@ void dictEmpty(dict *d, void(callback)(void*)) {
     d->iterators = 0;
 }
 
-void dictEnableResize(void) {
-    dict_can_resize = 1;
-}
-
-void dictDisableResize(void) {
-    dict_can_resize = 0;
+void dictSetResizeEnabled(dictResizeEnable enable) {
+    dict_can_resize = enable;
 }
 
 uint64_t dictGetHash(dict *d, const void *key) {
@@ -1071,7 +1076,9 @@ size_t _dictGetStatsHt(char *buf, size_t bufsize, dictht *ht, int tableid) {
 
     if (ht->used == 0) {
         return snprintf(buf,bufsize,
-            "No stats available for empty dictionaries\n");
+            "Hash table %d stats (%s):\n"
+            "No stats available for empty dictionaries\n",
+            tableid, (tableid == 0) ? "main hash table" : "rehashing target");
     }
 
     /* Compute stats. */
@@ -1119,7 +1126,7 @@ size_t _dictGetStatsHt(char *buf, size_t bufsize, dictht *ht, int tableid) {
             i, clvector[i], ((float)clvector[i]/ht->size)*100);
     }
 
-    /* Unlike snprintf(), teturn the number of characters actually written. */
+    /* Unlike snprintf(), return the number of characters actually written. */
     if (bufsize) buf[bufsize-1] = '\0';
     return strlen(buf);
 }
@@ -1232,6 +1239,13 @@ int main(int argc, char **argv) {
         sdsfree(key);
     }
     end_benchmark("Random access of existing elements");
+
+    start_benchmark();
+    for (j = 0; j < count; j++) {
+        dictEntry *de = dictGetRandomKey(dict);
+        assert(de != NULL);
+    }
+    end_benchmark("Accessing random keys");
 
     start_benchmark();
     for (j = 0; j < count; j++) {

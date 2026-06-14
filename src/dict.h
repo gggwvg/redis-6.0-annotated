@@ -33,10 +33,13 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdint.h>
-
 #ifndef __DICT_H
 #define __DICT_H
+
+#include "mt19937-64.h"
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #define DICT_OK 0
 #define DICT_ERR 1
@@ -91,7 +94,7 @@ typedef struct dictIterator {
     int table, safe;
     dictEntry *entry, *nextEntry;
     /* unsafe iterator fingerprint for misuse detection. */
-    long long fingerprint;
+    unsigned long long fingerprint;
 } dictIterator;
 
 typedef void (dictScanFunction)(void *privdata, const dictEntry *de);
@@ -147,6 +150,19 @@ typedef void (dictScanBucketFunction)(void *privdata, dictEntry **bucketref);
 #define dictSize(d) ((d)->ht[0].used+(d)->ht[1].used)
 #define dictIsRehashing(d) ((d)->rehashidx != -1)
 
+/* If our unsigned long type can store a 64 bit number, use a 64 bit PRNG. */
+#if ULONG_MAX >= 0xffffffffffffffff
+#define randomULong() ((unsigned long) genrand64_int64())
+#else
+#define randomULong() random()
+#endif
+
+typedef enum {
+    DICT_RESIZE_ENABLE,
+    DICT_RESIZE_AVOID,
+    DICT_RESIZE_FORBID,
+} dictResizeEnable;
+
 /* API */
 dict *dictCreate(dictType *type, void *privDataPtr);
 int dictExpand(dict *d, unsigned long size);
@@ -172,8 +188,7 @@ void dictGetStats(char *buf, size_t bufsize, dict *d);
 uint64_t dictGenHashFunction(const void *key, int len);
 uint64_t dictGenCaseHashFunction(const unsigned char *buf, int len);
 void dictEmpty(dict *d, void(callback)(void*));
-void dictEnableResize(void);
-void dictDisableResize(void);
+void dictSetResizeEnabled(dictResizeEnable enable);
 int dictRehash(dict *d, int n);
 int dictRehashMilliseconds(dict *d, int ms);
 void dictSetHashFunctionSeed(uint8_t *seed);
